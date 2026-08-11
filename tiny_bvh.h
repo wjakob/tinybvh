@@ -1818,7 +1818,7 @@ bool BVH_SoA::IsOccluded( const Ray& ) const { BVH_FATAL_ERROR( "BVH_SoA::IsOccl
 #define MOLLER_TRUMBORE_TEST( tmax, exit ) \
 	const bvhvec3 h = tinybvh_cross( ray.D, e2 );	\
 	const float a = tinybvh_dot( e1, h );			\
-	if (fabs( a ) < 0.000001f) exit;				\
+	if (a == 0) exit;								\
 	const float f = 1 / a;							\
 	const bvhvec3 s = ray.O - v0;					\
 	const float u = f * tinybvh_dot( s, h );		\
@@ -3979,7 +3979,7 @@ void BVH::Intersect256Rays( Ray* packet ) const
 					Ray& ray = packet[i];
 					const bvhvec3 h = tinybvh_cross( ray.D, e2 );
 					const float a = tinybvh_dot( e1, h );
-					if (fabs( a ) < 0.0000001f) continue; // ray parallel to triangle
+					if (a == 0) continue; // ray parallel to triangle
 					const float f = 1 / a, u = f * tinybvh_dot( s, h );
 					const bvhvec3 q = tinybvh_cross( s, e1 );
 					const float v = f * tinybvh_dot( ray.D, q );
@@ -7822,7 +7822,7 @@ void BVH::Intersect256RaysSSE( Ray* packet ) const
 					Ray& ray = packet[i];
 					const bvhvec3 h = tinybvh_cross( ray.D, e2 );
 					const float a = tinybvh_dot( e1, h );
-					if (fabs( a ) < 0.0000001f) continue; // ray parallel to triangle
+					if (a == 0) continue; // ray parallel to triangle
 					const float f = 1 / a, u = f * tinybvh_dot( s, h );
 					const bvhvec3 q = tinybvh_cross( s, e1 );
 					const float v = f * tinybvh_dot( ray.D, q );
@@ -9334,7 +9334,7 @@ int32_t BVH_Double::Intersect( RayEx& ray ) const
 				const bvhdbl3 e2 = verts[i2] - verts[i0];
 				const bvhdbl3 h = tinybvh_cross( ray.D, e2 );
 				const double a = tinybvh_dot( e1, h );
-				if (fabs( a ) < 0.0000001) continue; // ray parallel to triangle
+				if (a == 0) continue; // ray parallel to triangle
 				const double f = 1 / a;
 				const bvhdbl3 s = ray.O - verts[i0];
 				const double u = f * tinybvh_dot( s, h );
@@ -9443,7 +9443,7 @@ bool BVH_Double::IsOccluded( const RayEx& ray ) const
 				const bvhdbl3 e2 = verts[i2] - verts[i0];
 				const bvhdbl3 h = tinybvh_cross( ray.D, e2 );
 				const double a = tinybvh_dot( e1, h );
-				if (fabs( a ) < 0.0000001) continue; // ray parallel to triangle
+				if (a == 0) continue; // ray parallel to triangle
 				const double f = 1 / a;
 				const bvhdbl3 s = ray.O - verts[i0];
 				const double u = f * tinybvh_dot( s, h );
