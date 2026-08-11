@@ -500,15 +500,12 @@ TINYBVH_FORCEINLINE bool tinybvh_isnan( float f )
 }
 TINYBVH_FORCEINLINE float tinybvh_safercp( const float x )
 {
-#if 1
-	// my version
-	float r = 1 / x;
-	if (!tinybvh_isfinite( r )) r = copysignf( 3.402823466e+38F /* FLT_MAX */, x );
+	// Clamp to BVH_FAR rather than FLT_MAX: precomputed products such as
+	// ray.O.x * ray.rD.x must not overflow to inf, since inf slab bounds
+	// yield NaN or (under FP contraction) -inf and break traversal.
+	const float r = 1 / x;
+	if (!(fabsf( r ) <= BVH_FAR)) return copysignf( BVH_FAR, x );
 	return r;
-#else
-	// Madmann91's version
-	return fabs( x ) <= FLT_EPSILON ? copysign( 3.402823466e+38F /* FLT_MAX */, x ) : (1.0f / x );
-#endif
 }
 TINYBVH_FORCEINLINE bvhvec3 tinybvh_safercp( const bvhvec3 a ) { return bvhvec3( tinybvh_safercp( a.x ), tinybvh_safercp( a.y ), tinybvh_safercp( a.z ) ); }
 TINYBVH_FORCEINLINE bvhvec3 tinybvh_rcp( const bvhvec3 a ) { return tinybvh_safercp( a ); /* bvhvec3( 1.0f / a.x, 1.0f / a.y, 1.0f / a.z ); */ }
