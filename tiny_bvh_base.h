@@ -7154,9 +7154,10 @@ template <typename Float, typename Index> int32_t BVH8_CPU<Float, Index>::IsOccl
 	OCTANT_DISPATCH_IDX( IsOccludedPacketsOctant, octant, packets, packetCount )
 }
 
-// Reference packet traversal: trace the rays of a packet one at a time. Used on
-// targets without an AVX2 kernel, and by the AVX2 kernels for the cases they
-// leave out (currently: opacity maps).
+// Reference packet traversal: trace the rays of a packet one at a time with the
+// single ray kernel of the platform. Used on targets without a packet kernel,
+// and by the AVX2 packet kernels for the cases they leave out (currently:
+// opacity maps).
 template <typename Float, typename Index> template <bool posX, bool posY, bool posZ>
 int32_t BVH8_CPU<Float, Index>::IntersectPacketPerRay( RayPacket8& packet ) const
 {
@@ -7169,7 +7170,7 @@ int32_t BVH8_CPU<Float, Index>::IntersectPacketPerRay( RayPacket8& packet ) cons
 		ray.rD = Vec3( packet.rdx[lane], packet.rdy[lane], packet.rdz[lane] );
 		ray.hit.t = packet.t[lane], ray.hit.u = ray.hit.v = 0, ray.hit.prim = 0;
 		ray.instIdx = 0, ray.mask = packet.mask;
-		steps += tinybvh_wide_intersect<BVH8_CPU, 8, posX, posY, posZ>( bvh8Data, ray, opmap, opmapN );
+		steps += IntersectOctant<posX, posY, posZ>( ray );
 		if (ray.hit.t < packet.t[lane]) packet.t[lane] = ray.hit.t, packet.u[lane] = ray.hit.u,
 			packet.v[lane] = ray.hit.v, packet.prim[lane] = ray.hit.prim, packet.inst[lane] = packet.instIdx;
 	}
@@ -7189,8 +7190,7 @@ int32_t BVH8_CPU<Float, Index>::IsOccludedPacketPerRay( RayPacket8& packet ) con
 		ray.rD = Vec3( packet.rdx[lane], packet.rdy[lane], packet.rdz[lane] );
 		ray.hit.t = packet.t[lane], ray.instIdx = 0, ray.mask = packet.mask;
 		steps++;
-		if (tinybvh_wide_occluded<BVH8_CPU, 8, posX, posY, posZ>( bvh8Data, ray, opmap, opmapN ))
-			packet.occluded |= 1u << lane;
+		if (IsOccludedOctant<posX, posY, posZ>( ray )) packet.occluded |= 1u << lane;
 	}
 	return steps;
 }
