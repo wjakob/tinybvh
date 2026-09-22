@@ -736,6 +736,13 @@ TINYBVH_FORCEINLINE uint32_t neon_movemask8_popc( const uint32x4x2_t mask )
 	return vaddvq_u32( vaddq_u32( lo, hi ) );
 }
 
+// The eight lane masks as bytes of one 64-bit value: 0xff for a hit lane.
+TINYBVH_FORCEINLINE uint64_t neon_mask8_bytes( const uint32x4x2_t mask )
+{
+	const uint16x8_t m16 = vcombine_u16( vshrn_n_u32( mask.val[0], 16 ), vshrn_n_u32( mask.val[1], 16 ) );
+	return vget_lane_u64( vreinterpret_u64_u8( vshrn_n_u16( m16, 8 ) ), 0 );
+}
+
 // Select four lanes from a pair of vectors. TBL handles cross-half shuffles.
 TINYBVH_FORCEINLINE uint32x4_t neon_permute8( const uint32x4x2_t v, const uint32x4_t index )
 {
@@ -1027,31 +1034,27 @@ template <int octant> TINYBVH_FORCEINLINE bool neon_bvh8_occluded( const impl::B
 			const BVHNode* n = (const BVHNode*)(bvh8Data + nodeIdx);
 			float32x4x2_t tmin;
 			const uint32x4x2_t mask8 = neon_bvh8_slabs<octant>( n, rx4, ry4, rz4, rdx4, rdy4, rdz4, t4, tmin );
-			const uint32_t mask = neon_movemask8_popc( mask8 ), hitmask = mask & 255, hits = mask >> 8;
-			if (!hits)
-			{
-				if (!stackPtr) return false;
-				nodeIdx = nodeStack[--stackPtr];
-				continue;
-			}
-			if (hits == 1)
-			{
-				nodeIdx = vaddvq_u32( vaddq_u32( vandq_u32( vld1q_u32( n->child ), mask8.val[0] ),
-					vandq_u32( vld1q_u32( n->child + 4 ), mask8.val[1] ) ) );
-				continue;
-			}
+			// The traversal order does not matter here. Predicted branches on the mask
+			// bytes select the next child and push the others with scalar loads; a
+			// data dependency on the mask would serialize the node steps.
+			const uint64_t m64 = neon_mask8_bytes( mask8 );
+			const uint32_t* child = n->child;
 		#ifdef _DEBUG
-			BVH_FATAL_ERROR_IF( stackPtr + hits - 1 > TINYBVH_STACK_SIZE * 4, "BVH8_CPU::IsOccluded, traversal stack overflow." );
+			BVH_FATAL_ERROR_IF( stackPtr + 7 > TINYBVH_STACK_SIZE * 4, "BVH8_CPU::IsOccluded, traversal stack overflow." );
 		#endif
-			// Any hit needs no distance sort. Enter the highest lane, as in AVX2.
-			const uint32_t lane = __bfind( hitmask );
-			nodeIdx = n->child[lane];
-			for (uint32_t m = hitmask ^ (1u << lane); m; m &= m - 1)
-			{
-				const uint32_t c = n->child[__bfind( m & -m )];
-				nodeStack[stackPtr++] = c;
-				NEON_PREFETCH( bvh8Data + (c & 0x1fffffff) );
-			}
+			#define NEON8_HIT( l ) ((m64 >> (8 * (l))) & 1)
+			#define NEON8_PUSH( l ) if (NEON8_HIT( l )) nodeStack[stackPtr++] = child[l];
+			if (NEON8_HIT( 0 )) { NEON8_PUSH( 7 ) NEON8_PUSH( 6 ) NEON8_PUSH( 5 ) NEON8_PUSH( 4 ) NEON8_PUSH( 3 ) NEON8_PUSH( 2 ) NEON8_PUSH( 1 ) nodeIdx = child[0]; }
+			else if (NEON8_HIT( 1 )) { NEON8_PUSH( 7 ) NEON8_PUSH( 6 ) NEON8_PUSH( 5 ) NEON8_PUSH( 4 ) NEON8_PUSH( 3 ) NEON8_PUSH( 2 ) nodeIdx = child[1]; }
+			else if (NEON8_HIT( 2 )) { NEON8_PUSH( 7 ) NEON8_PUSH( 6 ) NEON8_PUSH( 5 ) NEON8_PUSH( 4 ) NEON8_PUSH( 3 ) nodeIdx = child[2]; }
+			else if (NEON8_HIT( 3 )) { NEON8_PUSH( 7 ) NEON8_PUSH( 6 ) NEON8_PUSH( 5 ) NEON8_PUSH( 4 ) nodeIdx = child[3]; }
+			else if (NEON8_HIT( 4 )) { NEON8_PUSH( 7 ) NEON8_PUSH( 6 ) NEON8_PUSH( 5 ) nodeIdx = child[4]; }
+			else if (NEON8_HIT( 5 )) { NEON8_PUSH( 7 ) NEON8_PUSH( 6 ) nodeIdx = child[5]; }
+			else if (NEON8_HIT( 6 )) { NEON8_PUSH( 7 ) nodeIdx = child[6]; }
+			else if (NEON8_HIT( 7 )) nodeIdx = child[7];
+			else { if (!stackPtr) return false; nodeIdx = nodeStack[--stackPtr]; }
+			#undef NEON8_PUSH
+			#undef NEON8_HIT
 		}
 		// Moeller-Trumbore ray/triangle intersection algorithm for four triangles
 		const BVHTri4Leaf* leaf = (BVHTri4Leaf*)(bvh8Data + (nodeIdx & 0x1fffffff));
