@@ -903,7 +903,7 @@ int main()
 
 #endif
 
-#if defined TRAVERSE_8WAY && defined BVH_USEAVX && defined BVH_USEAVX2
+#if defined TRAVERSE_8WAY && (defined BVH_USEAVX2 || defined BVH_USENEON)
 
 	// BVH8_CPU
 	if (!bvh8_cpu)

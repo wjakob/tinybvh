@@ -286,7 +286,7 @@ WARNING( "AVX not enabled in compilation." )
 WARNING( "AVX2 and FMA not enabled in compilation." )
 #define TINYBVH_NO_SIMD
 #else
-#define BVH_USEAVX2		// required for BVH8_CPU
+#define BVH_USEAVX2		// enables the x86 BVH8_CPU kernels
 #define BVH_USEAVX
 #define BVH_USESSE
 #endif

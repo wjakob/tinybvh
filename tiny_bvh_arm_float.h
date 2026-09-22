@@ -39,6 +39,8 @@ template <> void impl::BVH<float, uint32_t>::BuildSIMDSubtree( uint32_t nodeIdx,
 template <> void impl::BVH<float, uint32_t>::BuildSIMDFinalize();
 template <> template <bool posX, bool posY, bool posZ> int32_t impl::BVH4_CPU<float, uint32_t>::IntersectOctant( Ray& ray ) const;
 template <> template <bool posX, bool posY, bool posZ> bool impl::BVH4_CPU<float, uint32_t>::IsOccludedOctant( const Ray& ray ) const;
+template <> template <bool posX, bool posY, bool posZ> int32_t impl::BVH8_CPU<float, uint32_t>::IntersectOctant( Ray& ray ) const;
+template <> template <bool posX, bool posY, bool posZ> bool impl::BVH8_CPU<float, uint32_t>::IsOccludedOctant( const Ray& ray ) const;
 
 } // namespace tinybvh
 
@@ -713,6 +715,401 @@ template <> template <bool posX, bool posY, bool posZ> bool impl::BVH4_CPU<float
 }
 
 #undef NEON_HIT
+
+// ----------------------------------------------------------------------------
+// BVH8_CPU traversal: two four-lane NEON operations per eight-child node test.
+// The node and triangle layouts are shared with AVX2. Leaves use the BVH4 NEON
+// arithmetic, including the opacity maps.
+// ----------------------------------------------------------------------------
+
+#if defined _MSC_VER && !defined __clang__
+#define NEON_PREFETCH( p ) __prefetch( (const void*)(p) )
+#else
+#define NEON_PREFETCH( p ) __builtin_prefetch( (const void*)(p) )
+#endif
+
+// Lane mask in the low byte, population count in the next byte.
+TINYBVH_FORCEINLINE uint32_t neon_movemask8_popc( const uint32x4x2_t mask )
+{
+	const uint32x4_t lo = vandq_u32( mask.val[0], SIMD_SETRVECU( 0x101, 0x102, 0x104, 0x108 ) );
+	const uint32x4_t hi = vandq_u32( mask.val[1], SIMD_SETRVECU( 0x110, 0x120, 0x140, 0x180 ) );
+	return vaddvq_u32( vaddq_u32( lo, hi ) );
+}
+
+// Select four lanes from a pair of vectors. TBL handles cross-half shuffles.
+TINYBVH_FORCEINLINE uint32x4_t neon_permute8( const uint32x4x2_t v, const uint32x4_t index )
+{
+	const uint32x4_t bytes = vmlaq_u32( vdupq_n_u32( 0x03020100 ),
+		vandq_u32( index, vdupq_n_u32( 7 ) ), vdupq_n_u32( 0x04040404 ) );
+	const uint8x16x2_t table = { { vreinterpretq_u8_u32( v.val[0] ), vreinterpretq_u8_u32( v.val[1] ) } };
+	return vreinterpretq_u32_u8( vqtbl2q_u8( table, vreinterpretq_u8_u32( bytes ) ) );
+}
+
+TINYBVH_FORCEINLINE uint32x4_t neon_sort_step( const uint32x4_t v, const uint32x4_t other, const uint32x4_t high )
+{
+	return vbslq_u32( high, vmaxq_u32( v, other ), vminq_u32( v, other ) );
+}
+
+// The AVX2 bitonic network, with its cross-half stage expressed explicitly.
+TINYBVH_FORCEINLINE uint32x4x2_t neon_sort8( uint32x4x2_t d )
+{
+	const uint32x4_t m6 = SIMD_SETRVECU( 0, ~0u, ~0u, 0 );
+	const uint32x4_t mc = SIMD_SETRVECU( 0, 0, ~0u, ~0u );
+	const uint32x4_t ma = SIMD_SETRVECU( 0, ~0u, 0, ~0u );
+	d.val[0] = neon_sort_step( d.val[0], vrev64q_u32( d.val[0] ), m6 );
+	d.val[1] = neon_sort_step( d.val[1], vrev64q_u32( d.val[1] ), m6 );
+	d.val[0] = neon_sort_step( d.val[0], vextq_u32( d.val[0], d.val[0], 2 ), mc );
+	d.val[1] = neon_sort_step( d.val[1], vextq_u32( d.val[1], d.val[1], 2 ), vmvnq_u32( mc ) );
+	d.val[0] = neon_sort_step( d.val[0], vrev64q_u32( d.val[0] ), ma );
+	d.val[1] = neon_sort_step( d.val[1], vrev64q_u32( d.val[1] ), vmvnq_u32( ma ) );
+	const uint32x4_t lo = vminq_u32( d.val[0], d.val[1] ), hi = vmaxq_u32( d.val[0], d.val[1] );
+	d.val[0] = neon_sort_step( lo, vextq_u32( lo, lo, 2 ), mc );
+	d.val[1] = neon_sort_step( hi, vextq_u32( hi, hi, 2 ), mc );
+	d.val[0] = neon_sort_step( d.val[0], vrev64q_u32( d.val[0] ), ma );
+	d.val[1] = neon_sort_step( d.val[1], vrev64q_u32( d.val[1] ), ma );
+	return d;
+}
+
+// Broadcast ray terms, computed once per ray.
+struct NeonRay8
+{
+	float32x4_t ox4, oy4, oz4, dx4, dy4, dz4, rdx4, rdy4, rdz4;
+	float t;
+};
+
+// Load one float and broadcast it. Clang otherwise widens vdupq_n_f32 of a
+// struct member into a 16-byte load that straddles several of the caller's
+// recent scalar stores to the ray, which defeats store forwarding and makes
+// the closest-hit kernel up to 40% slower on Apple silicon.
+TINYBVH_FORCEINLINE float32x4_t neon_bcast( const float* p )
+{
+#if defined __GNUC__ || defined __clang__
+	float32x4_t r;
+	__asm__( "ld1r {%0.4s}, [%1]" : "=w"(r) : "r"(p), "m"(*p) );
+	return r;
+#else
+	return vld1q_dup_f32( p );
+#endif
+}
+
+TINYBVH_FORCEINLINE NeonRay8 neon_ray8( const impl::Ray<float, uint32_t>& ray )
+{
+	NeonRay8 r;
+	r.ox4 = neon_bcast( &ray.O.x ), r.oy4 = neon_bcast( &ray.O.y ), r.oz4 = neon_bcast( &ray.O.z );
+	r.dx4 = neon_bcast( &ray.D.x ), r.dy4 = neon_bcast( &ray.D.y ), r.dz4 = neon_bcast( &ray.D.z );
+	r.rdx4 = neon_bcast( &ray.rD.x ), r.rdy4 = neon_bcast( &ray.rD.y ), r.rdz4 = neon_bcast( &ray.rD.z );
+	r.t = ray.hit.t;
+	return r;
+}
+
+// Slab test of the eight children. The octant fixes the direction signs (bit 0:
+// x, bit 1: y, bit 2: z, set when positive), which selects the near and far
+// planes at compile time.
+template <int octant>
+TINYBVH_FORCEINLINE uint32x4x2_t neon_bvh8_slabs( const impl::BVH8_CPU<float, uint32_t>::BVHNode* n,
+	const float32x4_t rx4, const float32x4_t ry4, const float32x4_t rz4,
+	const float32x4_t rdx4, const float32x4_t rdy4, const float32x4_t rdz4,
+	const float32x4_t t4, float32x4x2_t& tmin )
+{
+	const float* xn = (octant & 1) ? n->xmin : n->xmax, * xf = (octant & 1) ? n->xmax : n->xmin;
+	const float* yn = (octant & 2) ? n->ymin : n->ymax, * yf = (octant & 2) ? n->ymax : n->ymin;
+	const float* zn = (octant & 4) ? n->zmin : n->zmax, * zf = (octant & 4) ? n->zmax : n->zmin;
+	uint32x4x2_t mask;
+	for (int half = 0; half < 2; half++)
+	{
+		const int i = half * 4;
+		const float32x4_t tx1 = vfmaq_f32( rx4, vld1q_f32( xn + i ), rdx4 );
+		const float32x4_t ty1 = vfmaq_f32( ry4, vld1q_f32( yn + i ), rdy4 );
+		const float32x4_t tz1 = vfmaq_f32( rz4, vld1q_f32( zn + i ), rdz4 );
+		const float32x4_t tx2 = vfmaq_f32( rx4, vld1q_f32( xf + i ), rdx4 );
+		const float32x4_t ty2 = vfmaq_f32( ry4, vld1q_f32( yf + i ), rdy4 );
+		const float32x4_t tz2 = vfmaq_f32( rz4, vld1q_f32( zf + i ), rdz4 );
+		tmin.val[half] = vmaxq_f32( vmaxq_f32( tx1, ty1 ), vmaxq_f32( tz1, vdupq_n_f32( 0 ) ) );
+		const float32x4_t tmax = vminq_f32( vminq_f32( tx2, ty2 ), vminq_f32( tz2, t4 ) );
+		mask.val[half] = vcleq_f32( tmin.val[half], tmax );
+	}
+	return mask;
+}
+
+// Ray terms of both kernels. The slab test computes bound * rD - O * rD using
+// a fused multiply-add.
+#define NEON_RAY8_TERMS( r ) \
+	const float32x4_t ox4 = r.ox4, oy4 = r.oy4, oz4 = r.oz4, dx4 = r.dx4, dy4 = r.dy4, dz4 = r.dz4; \
+	const float32x4_t rdx4 = r.rdx4, rdy4 = r.rdy4, rdz4 = r.rdz4; \
+	const float32x4_t rx4 = vnegq_f32( vmulq_f32( ox4, rdx4 ) ), ry4 = vnegq_f32( vmulq_f32( oy4, rdy4 ) ), rz4 = vnegq_f32( vmulq_f32( oz4, rdz4 ) );
+
+// Inlined into the entry point, so that the ray terms are read straight into registers.
+template <int octant> TINYBVH_FORCEINLINE int32_t neon_bvh8_intersect( const impl::BVH8_CPU<float, uint32_t>& bvh,
+	const NeonRay8& r, impl::Intersection<float, uint32_t>& hit, const uint32_t instIdx )
+{
+	using BVH8 = impl::BVH8_CPU<float, uint32_t>;
+	using BVHNode = BVH8::BVHNode;
+	using BVHTri4Leaf = BVH8::BVHTri4Leaf;
+	using CacheLine = BVH8::CacheLine;
+	constexpr uint32_t LEAF_BIT = BVH8::LEAF_BIT;
+	const CacheLine* bvh8Data = bvh.bvh8Data;
+	uint32_t* opmap = bvh.opmap;
+	const uint32_t opmapN = bvh.opmapN;
+	ALIGNED( 64 ) uint32_t nodeStack[TINYBVH_STACK_SIZE * 4 + 8 /* room for full vector stores */];
+	ALIGNED( 64 ) float distStack[TINYBVH_STACK_SIZE * 4 + 8];
+	const float32x4_t zero4 = vdupq_n_f32( 0 ), one4 = vdupq_n_f32( 1 ), inf4 = vdupq_n_f32( 1e34f );
+	float32x4_t t4 = vdupq_n_f32( r.t );
+	int32_t stackPtr = 0;
+	uint32_t nodeIdx = 0;
+	float tcur = r.t;
+	NEON_RAY8_TERMS( r )
+#ifdef _DEBUG
+	uint32_t steps = 0;
+#endif
+	while (1)
+	{
+		while (!(nodeIdx & LEAF_BIT)) ISLIKELY
+		{
+		#ifdef _DEBUG
+			steps++;
+		#endif
+			const BVHNode* n = (const BVHNode*)(bvh8Data + nodeIdx);
+			float32x4x2_t tmin;
+			const uint32x4x2_t mask8 = neon_bvh8_slabs<octant>( n, rx4, ry4, rz4, rdx4, rdy4, rdz4, t4, tmin );
+			const uint32_t mask = neon_movemask8_popc( mask8 ), hitmask = mask & 255, hits = mask >> 8;
+		#ifdef BVH8_USE_PREFETCHING
+			for (uint32_t m = hitmask; m; m &= m - 1)
+			{
+				const CacheLine* line = bvh8Data + (n->child[__bfind( m & -m )] & 0x1fffffff);
+				NEON_PREFETCH( line ); NEON_PREFETCH( line + 1 ); NEON_PREFETCH( line + 2 ); NEON_PREFETCH( line + 3 );
+			}
+		#endif
+			if (hits == 1)
+			{
+				// Avoid a mask-dependent child load in the common single-child case.
+				nodeIdx = vaddvq_u32( vaddq_u32( vandq_u32( vld1q_u32( n->child ), mask8.val[0] ),
+					vandq_u32( vld1q_u32( n->child + 4 ), mask8.val[1] ) ) );
+				continue;
+			}
+			if (!hits)
+			{
+				do { if (!stackPtr) goto the_end; nodeIdx = nodeStack[--stackPtr]; } while (distStack[stackPtr] > tcur);
+				continue;
+			}
+		#ifdef _DEBUG
+			BVH_FATAL_ERROR_IF( stackPtr + hits - 1 > TINYBVH_STACK_SIZE * 4, "BVH8_CPU::Intersect, traversal stack overflow." );
+		#endif
+		#ifdef BVH8_2VALIDNODES
+			if (hits == 2)
+			{
+				const uint32_t a = __bfind( hitmask ), b = __bfind( hitmask & -hitmask );
+				const float da = tinybvh_getlane_f( &tmin, a ), db = tinybvh_getlane_f( &tmin, b );
+				const bool first = da < db;
+				nodeIdx = n->child[first ? a : b];
+				nodeStack[stackPtr] = n->child[first ? b : a];
+				distStack[stackPtr++] = first ? db : da;
+				continue;
+			}
+		#endif
+		#ifdef BVH8_SORTING_NETWORK
+			const uint32x4_t lane0 = SIMD_SETRVECU( 0, 1, 2, 3 ), lane1 = SIMD_SETRVECU( 4, 5, 6, 7 );
+			const uint32x4x2_t distance = { { vreinterpretq_u32_f32( tmin.val[0] ), vreinterpretq_u32_f32( tmin.val[1] ) } };
+			// Nonnegative entry distances sort as integers; keep the lane in the low three bits.
+			uint32x4x2_t key = { {
+				vbslq_u32( mask8.val[0], vorrq_u32( vandq_u32( distance.val[0], vdupq_n_u32( ~7u ) ), lane0 ), vdupq_n_u32( 0x7fffffff ) ),
+				vbslq_u32( mask8.val[1], vorrq_u32( vandq_u32( distance.val[1], vdupq_n_u32( ~7u ) ), lane1 ), vdupq_n_u32( 0x7fffffff ) ) } };
+			key = neon_sort8( key );
+			nodeIdx = n->child[vgetq_lane_u32( key.val[0], 0 ) & 7];
+			const uint32x4x2_t child = { { vld1q_u32( n->child ), vld1q_u32( n->child + 4 ) } };
+			// Reverse the valid lanes: the closest child becomes the top of the stack.
+			const uint32x4_t end = vdupq_n_u32( hits - 1 );
+			const uint32x4_t order0 = neon_permute8( key, vsubq_u32( end, lane0 ) );
+			const uint32x4_t order1 = neon_permute8( key, vsubq_u32( end, lane1 ) );
+			vst1q_u32( nodeStack + stackPtr, neon_permute8( child, order0 ) );
+			vst1q_u32( nodeStack + stackPtr + 4, neon_permute8( child, order1 ) );
+			vst1q_f32( distStack + stackPtr, vreinterpretq_f32_u32( neon_permute8( distance, order0 ) ) );
+			vst1q_f32( distStack + stackPtr + 4, vreinterpretq_f32_u32( neon_permute8( distance, order1 ) ) );
+			stackPtr += hits - 1;
+		#else
+			// Octant order from the node's permutation table, farthest child first.
+			constexpr int signShift = 3 * octant;
+			uint32_t next = 8;
+			for (uint32_t i = 0; i < 8; i++)
+			{
+				const uint32_t lane = (n->perm[i] >> signShift) & 7;
+				if (!(hitmask & (1u << lane))) continue;
+				if (next != 8) nodeStack[stackPtr] = n->child[next], distStack[stackPtr++] = tinybvh_getlane_f( &tmin, next );
+				next = lane;
+			}
+			nodeIdx = n->child[next];
+		#endif
+		}
+		// Moeller-Trumbore ray/triangle intersection algorithm for four triangles
+		const BVHTri4Leaf* leaf = (BVHTri4Leaf*)(bvh8Data + (nodeIdx & 0x1fffffff));
+		const float32x4_t hx4 = vfmsq_f32( vmulq_f32( dy4, vld1q_f32( leaf->e2z ) ), dz4, vld1q_f32( leaf->e2y ) );
+		const float32x4_t hy4 = vfmsq_f32( vmulq_f32( dz4, vld1q_f32( leaf->e2x ) ), dx4, vld1q_f32( leaf->e2z ) );
+		const float32x4_t hz4 = vfmsq_f32( vmulq_f32( dx4, vld1q_f32( leaf->e2y ) ), dy4, vld1q_f32( leaf->e2x ) );
+		const float32x4_t sx4 = vsubq_f32( ox4, vld1q_f32( leaf->v0x ) ), sy4 = vsubq_f32( oy4, vld1q_f32( leaf->v0y ) ), sz4 = vsubq_f32( oz4, vld1q_f32( leaf->v0z ) );
+		const float32x4_t det4 = vfmaq_f32( vfmaq_f32( vmulq_f32( vld1q_f32( leaf->e1y ), hy4 ), vld1q_f32( leaf->e1x ), hx4 ), vld1q_f32( leaf->e1z ), hz4 );
+		const float32x4_t qz4 = vfmsq_f32( vmulq_f32( sx4, vld1q_f32( leaf->e1y ) ), sy4, vld1q_f32( leaf->e1x ) );
+		const float32x4_t qx4 = vfmsq_f32( vmulq_f32( sy4, vld1q_f32( leaf->e1z ) ), sz4, vld1q_f32( leaf->e1y ) );
+		const float32x4_t qy4 = vfmsq_f32( vmulq_f32( sz4, vld1q_f32( leaf->e1x ) ), sx4, vld1q_f32( leaf->e1z ) );
+		const float32x4_t inv_det4 = vdivq_f32( one4, det4 );
+		const float32x4_t u4 = vmulq_f32( vfmaq_f32( vfmaq_f32( vmulq_f32( sy4, hy4 ), sx4, hx4 ), sz4, hz4 ), inv_det4 );
+		const float32x4_t v4 = vmulq_f32( vfmaq_f32( vfmaq_f32( vmulq_f32( dy4, qy4 ), dx4, qx4 ), dz4, qz4 ), inv_det4 );
+		const float32x4_t ta4 = vmulq_f32( vfmaq_f32( vfmaq_f32( vmulq_f32( vld1q_f32( leaf->e2y ), qy4 ), vld1q_f32( leaf->e2x ), qx4 ), vld1q_f32( leaf->e2z ), qz4 ), inv_det4 );
+		const uint32x4_t mask1 = vandq_u32( vcgeq_f32( u4, zero4 ), vcgeq_f32( v4, zero4 ) );
+		const uint32x4_t mask2 = vcleq_f32( vaddq_f32( u4, v4 ), one4 );
+		const uint32x4_t mask3 = vandq_u32( vcltq_f32( ta4, t4 ), vcgtq_f32( ta4, zero4 ) );
+		uint32x4_t combined = vandq_u32( vandq_u32( mask1, mask2 ), mask3 );
+		uint32_t imask = neon_movemask_popc( combined ) & 15;
+		// evaluate opacity map, if present (NEON version).
+		if (opmap) if (imask)
+		{
+			const float32x4_t fN4 = vdupq_n_f32( (float)opmapN );
+			const int32x4_t row4 = vcvtq_s32_f32( vmulq_f32( vaddq_f32( u4, v4 ), fN4 ) );
+			const int32x4_t dia4 = vcvtq_s32_f32( vmulq_f32( vsubq_f32( one4, u4 ), fN4 ) );
+			const int32x4_t v0 = vmulq_s32( row4, row4 );
+			const int32x4_t v1 = vcvtq_s32_f32( vmulq_f32( v4, fN4 ) );
+			const int32x4_t v2 = vsubq_s32( dia4, vsubq_s32( vdupq_n_s32( opmapN - 1 ), row4 ) );
+			uint32_t idx[4], omask[4] = { 0, 0, 0, 0 };
+			vst1q_u32( idx, vreinterpretq_u32_s32( vaddq_s32( vaddq_s32( v0, v1 ), v2 ) ) );
+			// gather the opacity bits with scalar loads
+			for (int i = 0; i < 4; i++) if (imask & (1 << i))
+			{
+				uint32_t* om = opmap + leaf->primIdx[i] * ((opmapN * opmapN + 31) >> 5);
+				if (om[idx[i] >> 5] & (1 << (idx[i] & 31))) omask[i] = 0xffffffff;
+			}
+			// combine
+			combined = vandq_u32( combined, vld1q_u32( omask ) );
+			imask = neon_movemask_popc( combined ) & 15;
+		}
+		if (imask)
+		{
+			const float32x4_t dist4 = vbslq_f32( combined, ta4, inf4 );
+			const float t = vminvq_f32( dist4 );
+			const uint32_t lane = __bfind( neon_movemask_popc( vceqq_f32( dist4, vdupq_n_f32( t ) ) ) & 15 );
+			// update hit record
+			hit.t = t, hit.u = tinybvh_getlane_f( &u4, lane ), hit.v = tinybvh_getlane_f( &v4, lane );
+		#if INST_IDX_BITS == 32
+			hit.prim = leaf->primIdx[lane], hit.inst = instIdx;
+		#else
+			hit.prim = leaf->primIdx[lane] + instIdx;
+		#endif
+			t4 = vdupq_n_f32( t ), tcur = t;
+		}
+		// Deferred nodes behind the current hit are culled on pop, as in NEON BVH4,
+		// instead of compacting the entire stack after each leaf hit.
+		do { if (!stackPtr) goto the_end; nodeIdx = nodeStack[--stackPtr]; } while (distStack[stackPtr] > tcur);
+	}
+the_end:
+#ifdef _DEBUG
+	return steps;
+#else
+	return 0;
+#endif
+}
+
+template <int octant> TINYBVH_FORCEINLINE bool neon_bvh8_occluded( const impl::BVH8_CPU<float, uint32_t>& bvh, const NeonRay8& r )
+{
+	using BVH8 = impl::BVH8_CPU<float, uint32_t>;
+	using BVHNode = BVH8::BVHNode;
+	using BVHTri4Leaf = BVH8::BVHTri4Leaf;
+	using CacheLine = BVH8::CacheLine;
+	constexpr uint32_t LEAF_BIT = BVH8::LEAF_BIT;
+	const CacheLine* bvh8Data = bvh.bvh8Data;
+	uint32_t* opmap = bvh.opmap;
+	const uint32_t opmapN = bvh.opmapN;
+	ALIGNED( 64 ) uint32_t nodeStack[TINYBVH_STACK_SIZE * 4 + 8 /* wide trees push more nodes per step */];
+	int32_t stackPtr = 0;
+	uint32_t nodeIdx = 0;
+	const float32x4_t zero4 = vdupq_n_f32( 0 ), one4 = vdupq_n_f32( 1 ), t4 = vdupq_n_f32( r.t );
+	NEON_RAY8_TERMS( r )
+	while (1)
+	{
+		while (!(nodeIdx & LEAF_BIT)) ISLIKELY
+		{
+			const BVHNode* n = (const BVHNode*)(bvh8Data + nodeIdx);
+			float32x4x2_t tmin;
+			const uint32x4x2_t mask8 = neon_bvh8_slabs<octant>( n, rx4, ry4, rz4, rdx4, rdy4, rdz4, t4, tmin );
+			const uint32_t mask = neon_movemask8_popc( mask8 ), hitmask = mask & 255, hits = mask >> 8;
+			if (!hits)
+			{
+				if (!stackPtr) return false;
+				nodeIdx = nodeStack[--stackPtr];
+				continue;
+			}
+			if (hits == 1)
+			{
+				nodeIdx = vaddvq_u32( vaddq_u32( vandq_u32( vld1q_u32( n->child ), mask8.val[0] ),
+					vandq_u32( vld1q_u32( n->child + 4 ), mask8.val[1] ) ) );
+				continue;
+			}
+		#ifdef _DEBUG
+			BVH_FATAL_ERROR_IF( stackPtr + hits - 1 > TINYBVH_STACK_SIZE * 4, "BVH8_CPU::IsOccluded, traversal stack overflow." );
+		#endif
+			// Any hit needs no distance sort. Enter the highest lane, as in AVX2.
+			const uint32_t lane = __bfind( hitmask );
+			nodeIdx = n->child[lane];
+			for (uint32_t m = hitmask ^ (1u << lane); m; m &= m - 1)
+			{
+				const uint32_t c = n->child[__bfind( m & -m )];
+				nodeStack[stackPtr++] = c;
+				NEON_PREFETCH( bvh8Data + (c & 0x1fffffff) );
+			}
+		}
+		// Moeller-Trumbore ray/triangle intersection algorithm for four triangles
+		const BVHTri4Leaf* leaf = (BVHTri4Leaf*)(bvh8Data + (nodeIdx & 0x1fffffff));
+		const float32x4_t hx4 = vfmsq_f32( vmulq_f32( dy4, vld1q_f32( leaf->e2z ) ), dz4, vld1q_f32( leaf->e2y ) );
+		const float32x4_t hy4 = vfmsq_f32( vmulq_f32( dz4, vld1q_f32( leaf->e2x ) ), dx4, vld1q_f32( leaf->e2z ) );
+		const float32x4_t hz4 = vfmsq_f32( vmulq_f32( dx4, vld1q_f32( leaf->e2y ) ), dy4, vld1q_f32( leaf->e2x ) );
+		const float32x4_t sx4 = vsubq_f32( ox4, vld1q_f32( leaf->v0x ) ), sy4 = vsubq_f32( oy4, vld1q_f32( leaf->v0y ) ), sz4 = vsubq_f32( oz4, vld1q_f32( leaf->v0z ) );
+		const float32x4_t det4 = vfmaq_f32( vfmaq_f32( vmulq_f32( vld1q_f32( leaf->e1y ), hy4 ), vld1q_f32( leaf->e1x ), hx4 ), vld1q_f32( leaf->e1z ), hz4 );
+		const float32x4_t qz4 = vfmsq_f32( vmulq_f32( sx4, vld1q_f32( leaf->e1y ) ), sy4, vld1q_f32( leaf->e1x ) );
+		const float32x4_t qx4 = vfmsq_f32( vmulq_f32( sy4, vld1q_f32( leaf->e1z ) ), sz4, vld1q_f32( leaf->e1y ) );
+		const float32x4_t qy4 = vfmsq_f32( vmulq_f32( sz4, vld1q_f32( leaf->e1x ) ), sx4, vld1q_f32( leaf->e1z ) );
+		const float32x4_t inv_det4 = vdivq_f32( one4, det4 );
+		const float32x4_t u4 = vmulq_f32( vfmaq_f32( vfmaq_f32( vmulq_f32( sy4, hy4 ), sx4, hx4 ), sz4, hz4 ), inv_det4 );
+		const float32x4_t v4 = vmulq_f32( vfmaq_f32( vfmaq_f32( vmulq_f32( dy4, qy4 ), dx4, qx4 ), dz4, qz4 ), inv_det4 );
+		const float32x4_t ta4 = vmulq_f32( vfmaq_f32( vfmaq_f32( vmulq_f32( vld1q_f32( leaf->e2y ), qy4 ), vld1q_f32( leaf->e2x ), qx4 ), vld1q_f32( leaf->e2z ), qz4 ), inv_det4 );
+		const uint32x4_t mask1 = vandq_u32( vcgeq_f32( u4, zero4 ), vcgeq_f32( v4, zero4 ) );
+		const uint32x4_t mask2 = vcleq_f32( vaddq_f32( u4, v4 ), one4 );
+		const uint32x4_t mask3 = vandq_u32( vcltq_f32( ta4, t4 ), vcgtq_f32( ta4, zero4 ) );
+		const uint32x4_t combined = vandq_u32( vandq_u32( mask1, mask2 ), mask3 );
+		const uint32_t imask = neon_movemask_popc( combined ) & 15;
+		if (imask)
+		{
+			if (!opmap) return true;
+			// evaluate opacity map, NEON version.
+			const float32x4_t fN4 = vdupq_n_f32( (float)opmapN );
+			const int32x4_t row4 = vcvtq_s32_f32( vmulq_f32( vaddq_f32( u4, v4 ), fN4 ) );
+			const int32x4_t dia4 = vcvtq_s32_f32( vmulq_f32( vsubq_f32( one4, u4 ), fN4 ) );
+			const int32x4_t v0 = vmulq_s32( row4, row4 );
+			const int32x4_t v1 = vcvtq_s32_f32( vmulq_f32( v4, fN4 ) );
+			const int32x4_t v2 = vsubq_s32( dia4, vsubq_s32( vdupq_n_s32( opmapN - 1 ), row4 ) );
+			uint32_t idx[4];
+			vst1q_u32( idx, vreinterpretq_u32_s32( vaddq_s32( vaddq_s32( v0, v1 ), v2 ) ) );
+			// gather the opacity bits with scalar loads
+			for (int i = 0; i < 4; i++) if (imask & (1 << i))
+			{
+				uint32_t* om = opmap + leaf->primIdx[i] * ((opmapN * opmapN + 31) >> 5);
+				if (om[idx[i] >> 5] & (1 << (idx[i] & 31))) return true;
+			}
+		}
+		// we continue.
+		if (!stackPtr) return false;
+		nodeIdx = nodeStack[--stackPtr];
+	}
+}
+
+#undef NEON_RAY8_TERMS
+
+template <> template <bool posX, bool posY, bool posZ> int32_t impl::BVH8_CPU<float, uint32_t>::IntersectOctant( Ray& ray ) const
+{
+	return neon_bvh8_intersect<(posX ? 1 : 0) + (posY ? 2 : 0) + (posZ ? 4 : 0)>( *this, neon_ray8( ray ), ray.hit, ray.instIdx );
+}
+
+template <> template <bool posX, bool posY, bool posZ> bool impl::BVH8_CPU<float, uint32_t>::IsOccludedOctant( const Ray& ray ) const
+{
+	return neon_bvh8_occluded<(posX ? 1 : 0) + (posY ? 2 : 0) + (posZ ? 4 : 0)>( *this, neon_ray8( ray ) );
+}
+
+#undef NEON_PREFETCH
 
 } // namespace tinybvh
 
