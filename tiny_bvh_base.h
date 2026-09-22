@@ -3918,6 +3918,30 @@ template <typename Float, typename Index> template <bool posX, bool posY, bool p
 				// Check if the ray should intersect this BLAS Instance, otherwise skip it
 				if (!(inst.mask & ray.mask)) continue;
 				const BVHBase<Float, Index>* blas = blasList[inst.blasIdx];
+				if constexpr (bvh_traits<Float>::wide_layouts)
+				{
+					if (blas->layout == LAYOUT_BVH4_CPU || blas->layout == LAYOUT_BVH8_AVX2)
+					{
+						// The wide triangle kernels only touch the hit record, so the ray is
+						// transformed in place and its input fields are restored afterwards,
+						// which avoids copying the ray and the hit record to and from a
+						// temporary. The guard also restores them if validation throws.
+						struct RestoreRay
+						{
+							Ray& ray;
+							Vec3 origin, direction, reciprocal;
+							Index instIdx;
+							~RestoreRay() { ray.O = origin, ray.D = direction, ray.rD = reciprocal, ray.instIdx = instIdx; }
+						} restore { ray, ray.O, ray.D, ray.rD, ray.instIdx };
+						ray.O = tinybvh_transform_point( restore.origin, inst.invTransform );
+						ray.D = tinybvh_transform_vector( restore.direction, inst.invTransform );
+						ray.rD = tinybvh_rcp( ray.D );
+						ray.instIdx = instIdx << bvh_inst_shift<Index>;
+						if (blas->layout == LAYOUT_BVH4_CPU) cost += ((BVH4_CPU<Float, Index>*)blas)->Intersect( ray );
+						else cost += ((BVH8_CPU<Float, Index>*)blas)->Intersect( ray );
+						continue;
+					}
+				}
 				// 1. Transform ray with the inverse of the instance transform
 				tmpRay.O = tinybvh_transform_point( ray.O, inst.invTransform );
 				tmpRay.D = tinybvh_transform_vector( ray.D, inst.invTransform );
@@ -3931,12 +3955,6 @@ template <typename Float, typename Index> template <bool posX, bool posY, bool p
 			#ifdef ENABLE_VOXEL_SUPPORT
 				else if (blas->layout == LAYOUT_VOXELSET) cost += ((VoxelSet*)blas)->Intersect( tmpRay );
 			#endif
-				else if constexpr (bvh_traits<Float>::wide_layouts)
-				{
-					if (blas->layout == LAYOUT_BVH4_CPU) cost += ((BVH4_CPU<Float, Index>*)blas)->Intersect( tmpRay );
-					else if (blas->layout == LAYOUT_BVH8_AVX2) cost += ((BVH8_CPU<Float, Index>*)blas)->Intersect( tmpRay );
-					else assert( !"unsupported BLAS layout" );
-				}
 				else assert( !"unsupported BLAS layout" );
 				// 3. Restore ray
 				ray.hit = tmpRay.hit;
