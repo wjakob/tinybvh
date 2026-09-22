@@ -718,23 +718,10 @@ template <> template <bool posX, bool posY, bool posZ> bool impl::BVH4_CPU<float
 
 // ----------------------------------------------------------------------------
 // BVH8_CPU traversal: two four-lane NEON operations per eight-child node test.
-// The node and triangle layouts are shared with AVX2. Leaves use the BVH4 NEON
-// arithmetic, including the opacity maps.
+// The node and triangle layouts are shared with AVX2. The next node is selected
+// with predicted branches on the slab mask, as in the NEON BVH4 kernel. Leaves
+// use the BVH4 NEON arithmetic, including the opacity maps.
 // ----------------------------------------------------------------------------
-
-#if defined _MSC_VER && !defined __clang__
-#define NEON_PREFETCH( p ) __prefetch( (const void*)(p) )
-#else
-#define NEON_PREFETCH( p ) __builtin_prefetch( (const void*)(p) )
-#endif
-
-// Lane mask in the low byte, population count in the next byte.
-TINYBVH_FORCEINLINE uint32_t neon_movemask8_popc( const uint32x4x2_t mask )
-{
-	const uint32x4_t lo = vandq_u32( mask.val[0], SIMD_SETRVECU( 0x101, 0x102, 0x104, 0x108 ) );
-	const uint32x4_t hi = vandq_u32( mask.val[1], SIMD_SETRVECU( 0x110, 0x120, 0x140, 0x180 ) );
-	return vaddvq_u32( vaddq_u32( lo, hi ) );
-}
 
 // The eight lane masks as bytes of one 64-bit value: 0xff for a hit lane.
 TINYBVH_FORCEINLINE uint64_t neon_mask8_bytes( const uint32x4x2_t mask )
@@ -752,29 +739,21 @@ TINYBVH_FORCEINLINE uint32x4_t neon_permute8( const uint32x4x2_t v, const uint32
 	return vreinterpretq_u32_u8( vqtbl2q_u8( table, vreinterpretq_u8_u32( bytes ) ) );
 }
 
-TINYBVH_FORCEINLINE uint32x4_t neon_sort_step( const uint32x4_t v, const uint32x4_t other, const uint32x4_t high )
+// Lane order of a node for the octant, farthest first: (perm[i] >> signShift) & 7.
+template <int signShift> TINYBVH_FORCEINLINE uint32x4x2_t neon_order8( const uint32_t* perm )
 {
-	return vbslq_u32( high, vmaxq_u32( v, other ), vminq_u32( v, other ) );
+	uint32x4x2_t order;
+	order.val[0] = vshrq_n_u32( vshlq_n_u32( vld1q_u32( perm ), 29 - signShift ), 29 );
+	order.val[1] = vshrq_n_u32( vshlq_n_u32( vld1q_u32( perm + 4 ), 29 - signShift ), 29 );
+	return order;
 }
 
-// The AVX2 bitonic network, with its cross-half stage expressed explicitly.
-TINYBVH_FORCEINLINE uint32x4x2_t neon_sort8( uint32x4x2_t d )
+// The lane masks as bytes of one 64-bit value, in the given lane order.
+TINYBVH_FORCEINLINE uint64_t neon_mask8_ordered( const uint32x4x2_t mask, const uint32x4x2_t order )
 {
-	const uint32x4_t m6 = SIMD_SETRVECU( 0, ~0u, ~0u, 0 );
-	const uint32x4_t mc = SIMD_SETRVECU( 0, 0, ~0u, ~0u );
-	const uint32x4_t ma = SIMD_SETRVECU( 0, ~0u, 0, ~0u );
-	d.val[0] = neon_sort_step( d.val[0], vrev64q_u32( d.val[0] ), m6 );
-	d.val[1] = neon_sort_step( d.val[1], vrev64q_u32( d.val[1] ), m6 );
-	d.val[0] = neon_sort_step( d.val[0], vextq_u32( d.val[0], d.val[0], 2 ), mc );
-	d.val[1] = neon_sort_step( d.val[1], vextq_u32( d.val[1], d.val[1], 2 ), vmvnq_u32( mc ) );
-	d.val[0] = neon_sort_step( d.val[0], vrev64q_u32( d.val[0] ), ma );
-	d.val[1] = neon_sort_step( d.val[1], vrev64q_u32( d.val[1] ), vmvnq_u32( ma ) );
-	const uint32x4_t lo = vminq_u32( d.val[0], d.val[1] ), hi = vmaxq_u32( d.val[0], d.val[1] );
-	d.val[0] = neon_sort_step( lo, vextq_u32( lo, lo, 2 ), mc );
-	d.val[1] = neon_sort_step( hi, vextq_u32( hi, hi, 2 ), mc );
-	d.val[0] = neon_sort_step( d.val[0], vrev64q_u32( d.val[0] ), ma );
-	d.val[1] = neon_sort_step( d.val[1], vrev64q_u32( d.val[1] ), ma );
-	return d;
+	const uint8x8_t bytes = vmovn_u16( vcombine_u16( vmovn_u32( vshlq_n_u32( order.val[0], 2 ) ), vmovn_u32( vshlq_n_u32( order.val[1], 2 ) ) ) );
+	const uint8x16x2_t table = { { vreinterpretq_u8_u32( mask.val[0] ), vreinterpretq_u8_u32( mask.val[1] ) } };
+	return vget_lane_u64( vreinterpret_u64_u8( vqtbl2_u8( table, bytes ) ), 0 );
 }
 
 // Broadcast ray terms, computed once per ray.
@@ -878,73 +857,38 @@ template <int octant> TINYBVH_FORCEINLINE int32_t neon_bvh8_intersect( const imp
 			const BVHNode* n = (const BVHNode*)(bvh8Data + nodeIdx);
 			float32x4x2_t tmin;
 			const uint32x4x2_t mask8 = neon_bvh8_slabs<octant>( n, rx4, ry4, rz4, rdx4, rdy4, rdz4, t4, tmin );
-			const uint32_t mask = neon_movemask8_popc( mask8 ), hitmask = mask & 255, hits = mask >> 8;
-		#ifdef BVH8_USE_PREFETCHING
-			for (uint32_t m = hitmask; m; m &= m - 1)
-			{
-				const CacheLine* line = bvh8Data + (n->child[__bfind( m & -m )] & 0x1fffffff);
-				NEON_PREFETCH( line ); NEON_PREFETCH( line + 1 ); NEON_PREFETCH( line + 2 ); NEON_PREFETCH( line + 3 );
-			}
-		#endif
-			if (hits == 1)
-			{
-				// Avoid a mask-dependent child load in the common single-child case.
-				nodeIdx = vaddvq_u32( vaddq_u32( vandq_u32( vld1q_u32( n->child ), mask8.val[0] ),
-					vandq_u32( vld1q_u32( n->child + 4 ), mask8.val[1] ) ) );
-				continue;
-			}
-			if (!hits)
-			{
-				do { if (!stackPtr) goto the_end; nodeIdx = nodeStack[--stackPtr]; } while (distStack[stackPtr] > tcur);
-				continue;
-			}
+			// The next node is selected with predicted branches on the slab mask, in the
+			// node's order for the octant: enter the nearest hit child and push the others,
+			// farthest first, with their entry distances. As in the NEON BVH4 kernel, this
+			// keeps the address of the next node off the data path of the slab test.
+			const uint32_t* child = n->child, * perm = n->perm;
+			const uint32x4x2_t order = neon_order8<3 * octant>( perm );
+			const uint64_t m64 = neon_mask8_ordered( mask8, order );
+			const uint32x4x2_t tminU = { { vreinterpretq_u32_f32( tmin.val[0] ), vreinterpretq_u32_f32( tmin.val[1] ) } };
+			const float32x4_t ts0 = vreinterpretq_f32_u32( neon_permute8( tminU, order.val[0] ) );
+			const float32x4_t ts1 = vreinterpretq_f32_u32( neon_permute8( tminU, order.val[1] ) );
 		#ifdef _DEBUG
-			BVH_FATAL_ERROR_IF( stackPtr + hits - 1 > TINYBVH_STACK_SIZE * 4, "BVH8_CPU::Intersect, traversal stack overflow." );
+			BVH_FATAL_ERROR_IF( stackPtr + 7 > TINYBVH_STACK_SIZE * 4, "BVH8_CPU::Intersect, traversal stack overflow." );
 		#endif
-		#ifdef BVH8_2VALIDNODES
-			if (hits == 2)
+			#define NEON8_HIT( k ) ((m64 >> (8 * (k))) & 1)
+			#define NEON8_CHILD( k ) child[(perm[k] >> (3 * octant)) & 7]
+			#define NEON8_PUSH( k ) if (NEON8_HIT( k )) { nodeStack[stackPtr] = NEON8_CHILD( k ); vst1q_lane_f32( distStack + stackPtr, (k) < 4 ? ts0 : ts1, (k) & 3 ); stackPtr++; }
+			if (NEON8_HIT( 7 )) { NEON8_PUSH( 0 ) NEON8_PUSH( 1 ) NEON8_PUSH( 2 ) NEON8_PUSH( 3 ) NEON8_PUSH( 4 ) NEON8_PUSH( 5 ) NEON8_PUSH( 6 ) nodeIdx = NEON8_CHILD( 7 ); }
+			else if (NEON8_HIT( 6 )) { NEON8_PUSH( 0 ) NEON8_PUSH( 1 ) NEON8_PUSH( 2 ) NEON8_PUSH( 3 ) NEON8_PUSH( 4 ) NEON8_PUSH( 5 ) nodeIdx = NEON8_CHILD( 6 ); }
+			else if (NEON8_HIT( 5 )) { NEON8_PUSH( 0 ) NEON8_PUSH( 1 ) NEON8_PUSH( 2 ) NEON8_PUSH( 3 ) NEON8_PUSH( 4 ) nodeIdx = NEON8_CHILD( 5 ); }
+			else if (NEON8_HIT( 4 )) { NEON8_PUSH( 0 ) NEON8_PUSH( 1 ) NEON8_PUSH( 2 ) NEON8_PUSH( 3 ) nodeIdx = NEON8_CHILD( 4 ); }
+			else if (NEON8_HIT( 3 )) { NEON8_PUSH( 0 ) NEON8_PUSH( 1 ) NEON8_PUSH( 2 ) nodeIdx = NEON8_CHILD( 3 ); }
+			else if (NEON8_HIT( 2 )) { NEON8_PUSH( 0 ) NEON8_PUSH( 1 ) nodeIdx = NEON8_CHILD( 2 ); }
+			else if (NEON8_HIT( 1 )) { NEON8_PUSH( 0 ) nodeIdx = NEON8_CHILD( 1 ); }
+			else if (NEON8_HIT( 0 )) nodeIdx = NEON8_CHILD( 0 );
+			else
 			{
-				const uint32_t a = __bfind( hitmask ), b = __bfind( hitmask & -hitmask );
-				const float da = tinybvh_getlane_f( &tmin, a ), db = tinybvh_getlane_f( &tmin, b );
-				const bool first = da < db;
-				nodeIdx = n->child[first ? a : b];
-				nodeStack[stackPtr] = n->child[first ? b : a];
-				distStack[stackPtr++] = first ? db : da;
-				continue;
+				// skip entries behind the current hit
+				do { if (!stackPtr) goto the_end; nodeIdx = nodeStack[--stackPtr]; } while (distStack[stackPtr] > tcur);
 			}
-		#endif
-		#ifdef BVH8_SORTING_NETWORK
-			const uint32x4_t lane0 = SIMD_SETRVECU( 0, 1, 2, 3 ), lane1 = SIMD_SETRVECU( 4, 5, 6, 7 );
-			const uint32x4x2_t distance = { { vreinterpretq_u32_f32( tmin.val[0] ), vreinterpretq_u32_f32( tmin.val[1] ) } };
-			// Nonnegative entry distances sort as integers; keep the lane in the low three bits.
-			uint32x4x2_t key = { {
-				vbslq_u32( mask8.val[0], vorrq_u32( vandq_u32( distance.val[0], vdupq_n_u32( ~7u ) ), lane0 ), vdupq_n_u32( 0x7fffffff ) ),
-				vbslq_u32( mask8.val[1], vorrq_u32( vandq_u32( distance.val[1], vdupq_n_u32( ~7u ) ), lane1 ), vdupq_n_u32( 0x7fffffff ) ) } };
-			key = neon_sort8( key );
-			nodeIdx = n->child[vgetq_lane_u32( key.val[0], 0 ) & 7];
-			const uint32x4x2_t child = { { vld1q_u32( n->child ), vld1q_u32( n->child + 4 ) } };
-			// Reverse the valid lanes: the closest child becomes the top of the stack.
-			const uint32x4_t end = vdupq_n_u32( hits - 1 );
-			const uint32x4_t order0 = neon_permute8( key, vsubq_u32( end, lane0 ) );
-			const uint32x4_t order1 = neon_permute8( key, vsubq_u32( end, lane1 ) );
-			vst1q_u32( nodeStack + stackPtr, neon_permute8( child, order0 ) );
-			vst1q_u32( nodeStack + stackPtr + 4, neon_permute8( child, order1 ) );
-			vst1q_f32( distStack + stackPtr, vreinterpretq_f32_u32( neon_permute8( distance, order0 ) ) );
-			vst1q_f32( distStack + stackPtr + 4, vreinterpretq_f32_u32( neon_permute8( distance, order1 ) ) );
-			stackPtr += hits - 1;
-		#else
-			// Octant order from the node's permutation table, farthest child first.
-			constexpr int signShift = 3 * octant;
-			uint32_t next = 8;
-			for (uint32_t i = 0; i < 8; i++)
-			{
-				const uint32_t lane = (n->perm[i] >> signShift) & 7;
-				if (!(hitmask & (1u << lane))) continue;
-				if (next != 8) nodeStack[stackPtr] = n->child[next], distStack[stackPtr++] = tinybvh_getlane_f( &tmin, next );
-				next = lane;
-			}
-			nodeIdx = n->child[next];
-		#endif
+			#undef NEON8_PUSH
+			#undef NEON8_CHILD
+			#undef NEON8_HIT
 		}
 		// Moeller-Trumbore ray/triangle intersection algorithm for four triangles
 		const BVHTri4Leaf* leaf = (BVHTri4Leaf*)(bvh8Data + (nodeIdx & 0x1fffffff));
@@ -1111,8 +1055,6 @@ template <> template <bool posX, bool posY, bool posZ> bool impl::BVH8_CPU<float
 {
 	return neon_bvh8_occluded<(posX ? 1 : 0) + (posY ? 2 : 0) + (posZ ? 4 : 0)>( *this, neon_ray8( ray ) );
 }
-
-#undef NEON_PREFETCH
 
 } // namespace tinybvh
 
